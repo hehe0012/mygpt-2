@@ -4,9 +4,23 @@ import fire
 import json
 import os
 import numpy as np
-import tensorflow as tf
+import torch
 
-import model, sample, encoder
+import sample, encoder
+
+
+def _resolve_checkpoint(model_dir, checkpoint):
+    if checkpoint is not None:
+        return checkpoint
+
+    candidates = [
+        os.path.join(model_dir, 'model.pt'),
+        os.path.join(model_dir, 'pytorch_model.bin'),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError('No PyTorch checkpoint found. Expected model.pt or pytorch_model.bin')
 
 def sample_model(
     model_name='124M',
@@ -18,6 +32,8 @@ def sample_model(
     top_k=0,
     top_p=1,
     models_dir='models',
+    checkpoint=None,
+    device=None,
 ):
     """
     Run the sample_model
@@ -41,9 +57,10 @@ def sample_model(
      (i.e. contains the <model_name> folder)
     """
     models_dir = os.path.expanduser(os.path.expandvars(models_dir))
+    model_dir = os.path.join(models_dir, model_name)
     enc = encoder.get_encoder(model_name, models_dir)
-    hparams = model.default_hparams()
-    with open(os.path.join(models_dir, model_name, 'hparams.json')) as f:
+    hparams = sample.model.default_hparams()
+    with open(os.path.join(model_dir, 'hparams.json')) as f:
         hparams.override_from_dict(json.load(f))
 
     if length is None:
@@ -51,29 +68,46 @@ def sample_model(
     elif length > hparams.n_ctx:
         raise ValueError("Can't get samples longer than window size: %s" % hparams.n_ctx)
 
-    with tf.Session(graph=tf.Graph()) as sess:
-        np.random.seed(seed)
-        tf.set_random_seed(seed)
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-        output = sample.sample_sequence(
-            hparams=hparams, length=length,
+    np.random.seed(seed)
+    if seed is not None:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    gpt_model = sample.model.GPT2Model(hparams)
+    ckpt_path = _resolve_checkpoint(model_dir, checkpoint)
+    state = torch.load(ckpt_path, map_location=device)
+    if isinstance(state, dict) and 'state_dict' in state and isinstance(state['state_dict'], dict):
+        state = state['state_dict']
+    gpt_model.load_state_dict(state, strict=False)
+    gpt_model.to(device)
+    gpt_model.eval()
+
+    generated = 0
+    while nsamples == 0 or generated < nsamples:
+        out = sample.sample_sequence(
+            hparams=hparams,
+            length=length,
             start_token=enc.encoder['<|endoftext|>'],
             batch_size=batch_size,
-            temperature=temperature, top_k=top_k, top_p=top_p
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            model_instance=gpt_model,
+            device=device,
         )[:, 1:]
 
-        saver = tf.train.Saver()
-        ckpt = tf.train.latest_checkpoint(os.path.join(models_dir, model_name))
-        saver.restore(sess, ckpt)
-
-        generated = 0
-        while nsamples == 0 or generated < nsamples:
-            out = sess.run(output)
-            for i in range(batch_size):
-                generated += batch_size
-                text = enc.decode(out[i])
-                print("=" * 40 + " SAMPLE " + str(generated) + " " + "=" * 40)
-                print(text)
+        out = out.detach().cpu().tolist()
+        for i in range(batch_size):
+            generated += 1
+            text = enc.decode(out[i])
+            print("=" * 40 + " SAMPLE " + str(generated) + " " + "=" * 40)
+            print(text)
+            if nsamples != 0 and generated >= nsamples:
+                break
 
 if __name__ == '__main__':
     fire.Fire(sample_model)
